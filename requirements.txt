@@ -1,0 +1,20 @@
+# LLM - Official Anthropic SDK for Claude
+anthropic>=0.40.0
+
+# YouTube - Fetches transcripts without needing a YouTube API key
+youtube-transcript-api>=0.6.2
+
+# GitHub - Official GitHub API wrapper for Python
+PyGithub>=2.3.0
+
+# Data validation - Type-safe models passed between agents
+pydantic>=2.7.0
+
+# Environment variables - Loads secrets from .env file
+python-dotenv>=1.0.0
+
+# Rich terminal output - Colors, tables, progress bars
+rich>=13.7.0
+
+# Retry logic - Handles transient API failures gracefully
+tenacity>=8.3.0
