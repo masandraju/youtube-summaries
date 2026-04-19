@@ -108,45 +108,37 @@ class YouTubeAgent(BaseAgent):
 
     def _fetch_transcript(self, video_id: str) -> str:
         """
-        Fetches transcript using youtube-transcript-api.
+        Fetches transcript using youtube-transcript-api v0.6.x.
 
-        API changed in v0.6.x — now instance-based instead of class-based.
-        This method handles both old (<0.6) and new (>=0.6) versions automatically.
+        v0.6.x API — only two public methods exist: fetch() and list()
+          - fetch(video_id) → FetchedTranscript (default language)
+          - list(video_id)  → TranscriptList (iterate to find languages)
         """
+        api = YouTubeTranscriptApi()
         transcript_data = None
 
-        # ── New API (>= 0.6.x): instantiate the class first ──────────────────
+        # Attempt 1 — fetch default transcript directly
         try:
-            api = YouTubeTranscriptApi()
+            transcript_data = api.fetch(video_id)
+            self.log.info("Transcript fetched (default language)")
+        except Exception as e:
+            self.log.warning(f"Default fetch failed ({e}) — trying language list")
 
-            # Try English first
+        # Attempt 2 — list available transcripts and pick first one
+        if transcript_data is None:
             try:
-                transcript_data = api.fetch(video_id, languages=["en"])
-                self.log.info("Fetched English transcript (new API)")
-            except Exception:
-                # Fall back to any available language
-                self.log.warning("English not found — trying any available language (new API)")
                 transcript_list = api.list(video_id)
                 for t in transcript_list:
-                    self.log.info(f"Using transcript: lang={t.language_code}")
-                    transcript_data = api.fetch(video_id, languages=[t.language_code])
-                    break
-
-        except AttributeError:
-            # ── Old API (< 0.6.x): class-method style ────────────────────────
-            self.log.info("Falling back to old API style (< 0.6)")
-            try:
-                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
-            except Exception:
-                transcript_list_obj = YouTubeTranscriptApi.list_transcripts(video_id)
-                for t in transcript_list_obj:
+                    self.log.info(f"Found transcript: lang={t.language_code} generated={t.is_generated}")
                     transcript_data = t.fetch()
                     break
+            except Exception as e:
+                raise RuntimeError(f"No transcript available for video '{video_id}': {e}")
 
         if not transcript_data:
             raise RuntimeError(f"No transcript found for video: {video_id}")
 
-        # Support both dict-style {"text": ...} and object-style .text segments
+        # Segments can be dicts {"text": ...} or objects with .text attribute
         texts = []
         for segment in transcript_data:
             if isinstance(segment, dict):
