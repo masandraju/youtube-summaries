@@ -18,8 +18,10 @@ FLOW (fetch):
 """
 
 import os
+import re
+import json
 import base64
-from datetime import datetime
+from anthropic import Anthropic
 from github import Github, GithubException, UnknownObjectException
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -46,10 +48,11 @@ class GitHubAgent(BaseAgent):
         if not token or not username:
             raise EnvironmentError("GITHUB_TOKEN and GITHUB_USERNAME must be set in .env")
 
-        self._github   = Github(token)
-        self._username = username
+        self._github    = Github(token)
+        self._username  = username
         self._repo_name = repo
-        self._repo     = None   # Lazy-loaded on first use
+        self._repo      = None   # Lazy-loaded on first use
+        self._llm       = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     @property
     def name(self) -> str:
@@ -61,21 +64,25 @@ class GitHubAgent(BaseAgent):
 
     def _execute(self, task: Task) -> dict:
         """
-        Routes to push or fetch based on task.action.
-        task.action = "push"  → push a summary file to GitHub
-        task.action = "fetch" → retrieve a file from GitHub
-        task.action = "list"  → list all files in the repo
+        Routes to the correct method based on task.action.
+          push         → push a summary/file to GitHub
+          fetch        → retrieve a file from GitHub
+          list         → list all files in the repo
+          create_branch→ create a feature branch
+          push_code    → push generated code to a branch
+          create_pr    → open a pull request
+          code_review  → review code using Claude LLM
         """
         action = task.action.lower()
-
-        if action == "push":
-            return self._push(task.payload)
-        elif action == "fetch":
-            return self._fetch(task.payload)
-        elif action == "list":
-            return self._list_files()
+        if action == "push":          return self._push(task.payload)
+        elif action == "fetch":       return self._fetch(task.payload)
+        elif action == "list":        return self._list_files()
+        elif action == "create_branch":return self._create_branch(task.payload)
+        elif action == "push_code":   return self._push_code(task.payload)
+        elif action == "create_pr":   return self._create_pr(task.payload)
+        elif action == "code_review": return self._code_review(task.payload)
         else:
-            raise ValueError(f"Unknown GitHub action: '{action}'. Use push, fetch, or list.")
+            raise ValueError(f"Unknown GitHub action: '{action}'")
 
     # ─────────────────────────────────────────────────────────────────────────
     # REPO — Get or create
@@ -206,6 +213,200 @@ class GitHubAgent(BaseAgent):
         return {"files": files, "count": len(files)}
 
     # ─────────────────────────────────────────────────────────────────────────
+    # CREATE BRANCH — Creates a feature branch from main
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _create_branch(self, payload: dict) -> dict:
+        """
+        Creates a new git branch from main.
+        payload: {branch_name: "feature/SCRUM-42-user-login"}
+        """
+        branch_name = payload.get("branch_name", "")
+        if not branch_name:
+            raise ValueError("branch_name is required")
+
+        repo = self._get_repo()
+        self.log.info(f"Creating branch '{branch_name}' from main...")
+
+        try:
+            main = repo.get_branch("main")
+        except Exception:
+            main = repo.get_branch("master")
+
+        repo.create_git_ref(
+            ref=f"refs/heads/{branch_name}",
+            sha=main.commit.sha
+        )
+        self.log.success(f"Branch created → {branch_name}")
+        return {"branch_name": branch_name, "message": f"Branch '{branch_name}' created"}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PUSH CODE — Commits a generated code file to a branch
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _push_code(self, payload: dict) -> dict:
+        """
+        Pushes a generated code file to a specific branch.
+        payload: {branch_name, filepath, content, commit_message}
+        """
+        branch_name    = payload["branch_name"]
+        filepath       = payload["filepath"]
+        content        = payload["content"]
+        commit_message = payload.get("commit_message", f"Add {filepath}")
+
+        repo = self._get_repo()
+        self.log.info(f"Pushing '{filepath}' to branch '{branch_name}'...")
+
+        try:
+            existing = repo.get_contents(filepath, ref=branch_name)
+            result   = repo.update_file(filepath, commit_message, content,
+                                        existing.sha, branch=branch_name)
+            action   = "updated"
+        except UnknownObjectException:
+            result  = repo.create_file(filepath, commit_message, content,
+                                       branch=branch_name)
+            action  = "created"
+
+        url = result["content"].html_url
+        self.log.success(f"Code {action} → {url}")
+        return {"filepath": filepath, "branch": branch_name, "url": url, "action": action}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CREATE PR — Opens a pull request from feature branch → main
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _create_pr(self, payload: dict) -> dict:
+        """
+        Creates a Pull Request from feature branch to main.
+        payload: {branch_name, title, body}
+        Returns PR URL and PR number.
+        """
+        branch_name = payload["branch_name"]
+        title       = payload.get("title", f"PR from {branch_name}")
+        body        = payload.get("body", "")
+
+        repo = self._get_repo()
+        self.log.info(f"Creating PR: '{title}'...")
+
+        try:
+            base = repo.get_branch("main")
+            base_name = "main"
+        except Exception:
+            base_name = "master"
+
+        pr = repo.create_pull(
+            title=title,
+            body=body,
+            head=branch_name,
+            base=base_name
+        )
+        self.log.success(f"PR created → {pr.html_url}")
+        return {
+            "pr_url":    pr.html_url,
+            "pr_number": pr.number,
+            "title":     pr.title,
+            "branch":    branch_name,
+            "message":   f"Pull request created: {pr.html_url}"
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CODE REVIEW — Claude reviews code and returns structured feedback
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _code_review(self, payload: dict) -> dict:
+        """
+        Sends code to Claude for review. Returns structured feedback.
+        payload: {code, filename, ticket_summary}
+
+        Review covers:
+          - Overall assessment
+          - Code quality issues
+          - Security concerns
+          - Suggestions for improvement
+          - Score out of 10
+        """
+        code           = payload.get("code", "")
+        filename       = payload.get("filename", "code.py")
+        ticket_summary = payload.get("ticket_summary", "")
+
+        self.log.thinking(f"Claude reviewing '{filename}'...")
+
+        system = """You are a senior software engineer performing a code review.
+Analyze the code and return a JSON object with this exact structure:
+{
+  "overall": "string — 1-2 sentence overall assessment",
+  "score": 7,
+  "quality_issues": ["issue 1", "issue 2"],
+  "security_concerns": ["concern 1"],
+  "suggestions": ["suggestion 1", "suggestion 2"],
+  "positive_aspects": ["good thing 1"]
+}
+Return ONLY valid JSON. No markdown fences."""
+
+        user_msg = f"""Review this code written for ticket: "{ticket_summary}"
+
+File: {filename}
+
+```
+{code[:8000]}
+```"""
+
+        response = self._llm.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=system,
+            messages=[{"role": "user", "content": user_msg}]
+        )
+
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        try:
+            review = json.loads(raw)
+        except Exception:
+            review = {
+                "overall": raw[:300],
+                "score": 0,
+                "quality_issues": [],
+                "security_concerns": [],
+                "suggestions": [],
+                "positive_aspects": []
+            }
+
+        self.log.success(f"Code review complete — score: {review.get('score')}/10")
+
+        # Format as a readable JIRA comment
+        review["jira_comment"] = self._format_review_as_comment(review, filename)
+        return review
+
+    @staticmethod
+    def _format_review_as_comment(review: dict, filename: str) -> str:
+        """Formats the code review dict as a readable JIRA comment."""
+        lines = [
+            f"*Code Review — {filename}*",
+            f"Score: {review.get('score', '?')}/10",
+            "",
+            f"*Overall:* {review.get('overall', '')}",
+        ]
+        if review.get("positive_aspects"):
+            lines += ["", "*What's Good:*"]
+            lines += [f"- {p}" for p in review["positive_aspects"]]
+        if review.get("quality_issues"):
+            lines += ["", "*Quality Issues:*"]
+            lines += [f"- {i}" for i in review["quality_issues"]]
+        if review.get("security_concerns"):
+            lines += ["", "*Security Concerns:*"]
+            lines += [f"- {c}" for c in review["security_concerns"]]
+        if review.get("suggestions"):
+            lines += ["", "*Suggestions:*"]
+            lines += [f"- {s}" for s in review["suggestions"]]
+        return "\n".join(lines)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # HELPERS — Markdown formatter
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -215,17 +416,8 @@ class GitHubAgent(BaseAgent):
         Converts a TechnicalSummary dict into a well-formatted Markdown file.
         This is what gets committed to GitHub.
         """
-        now = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
         lines = [
             f"# {summary.get('title', 'YouTube Technical Summary')}",
-            "",
-            f"> **Generated:** {now}  ",
-            f"> **Source:** {summary.get('video_url', '')}  ",
-            f"> **Difficulty:** {summary.get('difficulty_level', '—')}  ",
-            f"> **Target Audience:** {summary.get('target_audience', '—')}  ",
-            f"> **Transcript Words:** {summary.get('transcript_length', 0):,}",
-            "",
-            "---",
             "",
             "## Overview",
             "",

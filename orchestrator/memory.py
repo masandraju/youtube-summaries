@@ -81,6 +81,30 @@ class Memory:
             )
         """)
 
+        # App state — key/value store for multi-step conversation flows
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS app_state (
+                key          TEXT PRIMARY KEY,
+                value        TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            )
+        """)
+
+        # JIRA ticket cache — avoid re-fetching tickets
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS jira_tickets (
+                ticket_key   TEXT PRIMARY KEY,
+                summary      TEXT NOT NULL,
+                issue_type   TEXT,
+                priority     TEXT,
+                status       TEXT,
+                description  TEXT,
+                url          TEXT,
+                pr_url       TEXT,
+                created_at   TEXT NOT NULL
+            )
+        """)
+
         self._conn.commit()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -183,6 +207,67 @@ class Memory:
             (limit,)
         ).fetchall()
         return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # APP STATE — Key/value store for multi-step flows
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_state(self, key: str, value: dict):
+        """Saves a state value (used for multi-step conversation tracking)."""
+        self._conn.execute(
+            """INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            (key, json.dumps(value), datetime.now().isoformat())
+        )
+        self._conn.commit()
+
+    def get_state(self, key: str) -> Optional[dict]:
+        """Returns a state value, or None if not set."""
+        row = self._conn.execute(
+            "SELECT value FROM app_state WHERE key=?", (key,)
+        ).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    def clear_state(self, key: str):
+        """Deletes a state entry."""
+        self._conn.execute("DELETE FROM app_state WHERE key=?", (key,))
+        self._conn.commit()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # JIRA TICKET CACHE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def cache_jira_ticket(self, ticket: dict):
+        """Saves or updates a JIRA ticket in local cache."""
+        self._conn.execute(
+            """INSERT INTO jira_tickets
+               (ticket_key, summary, issue_type, priority, status, description, url, pr_url, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(ticket_key) DO UPDATE SET
+                 summary=excluded.summary, status=excluded.status,
+                 pr_url=excluded.pr_url, description=excluded.description""",
+            (
+                ticket.get("key"), ticket.get("summary"), ticket.get("issue_type"),
+                ticket.get("priority"), ticket.get("status"), ticket.get("description"),
+                ticket.get("url"), ticket.get("pr_url"), datetime.now().isoformat()
+            )
+        )
+        self._conn.commit()
+
+    def get_jira_ticket(self, ticket_key: str) -> Optional[dict]:
+        """Returns a cached JIRA ticket."""
+        row = self._conn.execute(
+            "SELECT * FROM jira_tickets WHERE ticket_key=?", (ticket_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_jira_pr_url(self, ticket_key: str, pr_url: str):
+        """Stores the PR URL against a JIRA ticket."""
+        self._conn.execute(
+            "UPDATE jira_tickets SET pr_url=? WHERE ticket_key=?",
+            (pr_url, ticket_key)
+        )
+        self._conn.commit()
 
     def close(self):
         """Closes the database connection cleanly."""

@@ -32,6 +32,7 @@ class AgentType(str, Enum):
     """Which agent handles a task."""
     YOUTUBE    = "youtube"
     GITHUB     = "github"
+    JIRA       = "jira"
     UNKNOWN    = "unknown"
 
 
@@ -133,3 +134,53 @@ class RoutingDecision(BaseModel):
     payload:     dict                       # Extracted parameters from user input
     confidence:  float                      # 0.0 to 1.0 — how sure Claude is
     reasoning:   str                        # Why Claude made this decision
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JIRA AGENT — Input and Output shapes
+# ─────────────────────────────────────────────────────────────────────────────
+
+class JiraTicketInput(BaseModel):
+    """What the JIRA Agent needs to create a ticket."""
+    summary:     str                        # Ticket title
+    issue_type:  str = "Story"              # Story / Bug / Task / Epic
+    priority:    str = "Medium"             # Highest / High / Medium / Low
+    description: str = ""                  # Full ticket description
+
+
+class JiraTicket(BaseModel):
+    """A JIRA ticket returned after create or fetch."""
+    key:         str                        # e.g. SCRUM-42
+    summary:     str
+    status:      str
+    issue_type:  str
+    priority:    str
+    description: str
+    url:         str                        # Browser URL to the ticket
+    pr_url:      Optional[str] = None
+    assignee:    Optional[str] = None
+    created_at:  Optional[str] = None
+
+
+class JiraUpdateInput(BaseModel):
+    """What the JIRA Agent needs to update a ticket."""
+    ticket_key:  str                        # e.g. SCRUM-42
+    pr_url:      Optional[str] = None       # PR URL to link
+    comment:     Optional[str] = None       # Comment to add
+    status:      Optional[str] = None       # New status
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CODE FLOW — Multi-step: JIRA → Code → GitHub PR → Review → JIRA update
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CodeFlowResult(BaseModel):
+    """Full result of the write-code-for-ticket flow."""
+    ticket_key:     str
+    ticket_summary: str
+    branch_name:    str
+    filename:       str
+    pr_url:         str
+    pr_number:      int
+    review_summary: str
+    jira_updated:   bool
